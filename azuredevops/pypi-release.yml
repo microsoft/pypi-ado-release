@@ -1,0 +1,123 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+parameters:
+- name: releaseType
+  displayName: Release Type
+  type: string
+  default: Test
+  values:
+  - Test
+  - Production
+
+variables:
+  poolImage: "ubuntu-latest"
+  poolPythonVersion: 3.6
+  packageArtifactName: Wheels
+  versionArtifactName: Version
+  versionFileName: versionInfo.txt
+
+trigger: none # No CI build
+
+pr: none # Not for pull requests
+
+# ========================================================================
+
+stages:
+- stage: CreateWheel
+  displayName: Create Wheel Artifact
+  pool:
+    vmImage: $(poolImage)
+
+  jobs:
+  - job: CreateWheel
+    displayName: Build and publish wheel
+    pool:
+      vmImage: $(poolImage)
+    
+    steps:
+    - task: UsePythonVersion@0
+      displayName: 'Use Python $(poolPythonVersion)'
+      inputs:
+        versionSpec: $(poolPythonVersion)
+        addToPath: true
+
+    - template: python-infra-upgrade-step-template.yml
+
+    - script: pip install setuptools wheel 
+      displayName: 'Install setuptools'
+
+    - script: pip install -r requirements.txt
+      displayName: "Install requirements"
+
+    - script: python setup.py sdist bdist_wheel
+      displayName: "Build the wheel"
+
+    - task: PublishPipelineArtifact@1
+      displayName: "Publish wheels"
+      inputs:
+        path: $(System.DefaultWorkingDirectory)/dist
+        artifact: $(packageArtifactName)
+
+# ========================================================================
+
+- stage: UploadWheel
+  displayName: Upload Wheel to PyPI (${{parameters.releaseType}})
+  dependsOn: CreateWheel
+  pool:
+    vmImage: $(poolImage)
+
+  variables:
+    # Following is actually the name of the service connection from the Project Settings page
+    kvSubscription: "Fairness - Automation (cecafb73-04ae-4432-9f96-d96925d28058)"
+    ${{ if eq(parameters.releaseType, 'Test')}}:
+      kvVaultName: simplepackagetestsecrets
+      pypiUrl: https://test.pypi.org/legacy/
+    ${{ if eq(parameters.releaseType, 'Production')}}:
+      kvVaultName: simplepackageprodsecrets
+      pypiUrl: https://upload.pypi.org/legacy/
+
+  jobs:
+  - deployment: 'PyPI_${{parameters.releaseType}}_Upload'
+    displayName: PyPI ${{parameters.releaseType}} Upload
+    ${{ if eq(parameters.releaseType, 'Test')}}:
+      environment: 'PyPI-Test Deployment'
+    ${{ if eq(parameters.releaseType, 'Production')}}:
+      environment: 'PyPI Deployment'
+    pool:
+      vmImage: $(poolImage)
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: UsePythonVersion@0
+            displayName: 'Use Python $(poolPythonVersion)'
+            inputs:
+              versionSpec: $(poolPythonVersion)
+              addToPath: true
+          
+          - script: pip install twine
+            displayName: 'Install twine'
+
+          - task: AzureKeyVault@1
+            displayName: "Fetch deployment secrets from KeyVault"
+            inputs:
+              azureSubscription: ${{variables.kvSubscription}}
+              keyVaultName:  ${{variables.kvVaultName}}
+              secretsFilter: 'pypiusername,pypipassword'
+
+          # Quote the password argument in case it contains characters the shell might try to parse
+          - script: 'echo twine upload --verbose --repository-url $(pypiUrl) -u $(pypiusername) -p "$(pypipassword)" $(Pipeline.Workspace)/$(packageArtifactName)/*'
+            displayName: Upload to ${{parameters.releaseType}} PyPI
+  
+  - job: PyPI_Pause
+    pool: server
+    dependsOn: 'PyPI_${{parameters.releaseType}}_Upload'
+    displayName: PyPI Pause
+
+    steps:
+    - task: Delay@1
+      displayName: "Pause to allow PyPI updates to complete"
+      inputs:
+        delayForMinutes: "1"
